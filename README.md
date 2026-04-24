@@ -1,4 +1,4 @@
-# Collision Tree: Lock-Free HFT Feed Handler
+# Collision Tree: Lock-Free Market Feed Handler
 
 A simulation of a high-frequency trading (HFT) market data feed handler designed to address the **Micro-Burst Stall** problem in UDP ingress pipelines. The architecture employs a hierarchical, lock-free overwriting mechanism to conflate intermediate ticks in-flight, eliminating consumer backpressure and providing deterministic tail latency under sustained burst conditions (~3,000,000 packets/sec).
 
@@ -27,13 +27,17 @@ Benchmarks were conducted under a simulated high-volume market burst targeting a
 
 ## System Architecture
 
-The system models a production HFT ingress pipeline across three layers.
+The system models a production HFT ingress pipeline across four stages.
 
-**Network Ingress (UDP):** Uses `SO_REUSEPORT` to allow multiple consumer threads to bind to the same multicast group, simulating hardware-based Receive Side Scaling (RSS).
+**Ingress Layer and Kernel Bypass:** The production architecture is designed for Kernel Bypass networking (DPDK / Solarflare EFVI), delivering raw UDP multicast packets from the Exchange Gateway directly into user-space memory via DMA, bypassing OS context switches and interrupt overhead entirely. In the current prototype, hardware constraints preclude true kernel bypass; highly optimised POSIX UDP sockets are used instead. The downstream conflation mechanics are otherwise identical. A pool of concurrent network threads spin-polls these ingress channels. Upon intercepting a payload, each thread parses the raw binary data into a structured `MarketUpdate` object (symbol, price, quantity, monotonic sequence timestamp) and records an `arrival_tsc` via the CPU's RDTSC instruction for deterministic internal latency tracking.
 
-**The Collision Tree (`collision_arch/`):** The core lock-free data structure. Concurrent producers handle filtering, merging, and dropping of stale data. Incoming threads conflate intermediate ticks in-flight via a lock-free overwriting protocol. The consumer (strategy thread) operates in strict O(1) time by loading the root's sequence guard, copying the payload, and performing a final relaxed consistency check — ensuring only actionable, live market data is evaluated.
+**Gateway Routing and Deterministic Hashing:** To prevent cross-asset data corruption, a Symbol ID-based hash maps each parsed update to a dedicated, asset-specific Collision Tree. A secondary deterministic hash then maps the producing thread to a specific leaf node within that tree's Input Layer. Distributing initial concurrent writes across disjoint leaf nodes is central to the design: it breaks the convoy effect, diffuses CPU cache-coherency storms, and avoids the memory bus contention that degrades standard lock-free queues under burst load.
 
-**Async Logger (`spsc_arch/`):** A lock-free SPSC ring buffer that decouples the hot-path trading logic from cold-path disk I/O, enabling nanosecond-level latency measurement without inducing observer-effect stalls.
+**The Lock-Free Collision Tree (`collision_arch/collision.h`):** The core data structure replaces a linear queue buffer with a shallow, hierarchical tree of atomic nodes, each strictly padded and aligned to a 64-byte cache line boundary to eliminate false sharing. Every node holds an atomic sequence guard (`max_seq_seen`), the market payload, and the arrival timestamp. Rather than appending to a tail pointer, producers engage in a targeted lock-free overwriting protocol. A producer reads the node's sequence guard optimistically: if the guard is newer than the incoming packet, the packet is immediately dropped (conflated) as stale. If the producer holds fresher data, it executes an atomic CAS on the sequence guard to claim exclusive ownership and overwrites the payload. It then promotes the update to the next hierarchical level, repeating the protocol until it is either conflated by a newer packet or successfully captures the root node.
+
+**Execution Layer and Non-Blocking Polling:** The Strategy Processing Thread operates entirely independently of producer burst rates, eliminating the producer-consumer backpressure loop. It executes a time-multiplexed, non-blocking polling routine across the root nodes of all active asset trees. Because producers perform all filtering and conflation upstream, the consumer is relieved of queue-draining operations entirely. Each read executes in strict O(1) time: the strategy thread loads the root's sequence guard with acquire semantics, copies the payload and `arrival_tsc`, and performs a final relaxed consistency check to confirm no partial producer write occurred during the read window.
+
+**Async Logger (`spsc_arch/`):** A lock-free SPSC ring buffer decouples hot-path trading logic from cold-path disk I/O, enabling nanosecond-level latency measurement without inducing observer-effect stalls on the critical path.
 
 ---
 
