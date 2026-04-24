@@ -1,84 +1,173 @@
-# Collision Tree: High-Frequency Trading Feed Handler
+# Collision Tree: Lock-Free HFT Feed Handler
 
-The Collision Tree architecture is a simulation of a high-frequency trading (HFT) market data feed handler designed to solve the "Micro-Burst Stall" problem. It uses a hierarchical, lock-free overwriting mechanism to actively conflate intermediate ticks in-flight, mathematically eliminating consumer backpressure. This ensures deterministic tail latency and data freshness even under extreme network load (e.g., bursts of 3,000,000 packets per second).
+A simulation of a high-frequency trading (HFT) market data feed handler designed to address the **Micro-Burst Stall** problem in UDP ingress pipelines. The architecture employs a hierarchical, lock-free overwriting mechanism to conflate intermediate ticks in-flight, eliminating consumer backpressure and providing deterministic tail latency under sustained burst conditions (~3,000,000 packets/sec).
 
-**Key Achievement:** Evaluated against baseline lock-free SPSC and MPSC queue architectures under severe market bursts, the Collision Tree constrained the data staleness ratio to just 10.95% (compared to ~75% in baselines) and reduced p99 tail latency to 1.18 ms (down from 25.17 ms), exclusively evaluating the absolute live edge of the market.
+Evaluated against lock-free SPSC and MPSC queue baselines, the Collision Tree reduced the data staleness ratio to **10.95%** (vs. ~75% in both baselines) and constrained p99 tail latency to **1.18 ms** (vs. 25.17 ms in SPSC), processing exclusively the live edge of the market.
 
-## 🚀 Performance Benchmarks
+---
 
-Benchmarks were conducted using a simulated high-volume market burst targeting an injection rate of approximately 3,000,000 packets per second. The system was evaluated against lossless lock-free SPSC (Single-Producer Single-Consumer) and MPSC (Multi-Producer Single-Consumer) architectures.
+## Performance Benchmarks
 
-| Metric | SPSC Baseline | MPSC Baseline | Collision Tree (Proposed) | Improvement (vs SPSC) |
-| --- | --- | --- | --- | --- |
-| Average Sojourn Latency | 2.43 ms | 1.84 ms | 240 µs (0.24 ms) | ~10x Faster |
-| p99 Tail Latency | 25.17 ms | 19.48 ms | 1.18 ms | ~21x More Stable |
-| Data Staleness Ratio | ~75% | ~75% | 10.95% | 6.8x Fresher Data |
-| Backpressure Spins | >1.09 million | 0 (bottlenecked) | 0 | Eliminated |
-| Packets/sec (Consumer) | Millions (historical) | Millions (historical) | ~87,000 (live edge only)| Maximizes Goodput |
+Benchmarks were conducted under a simulated high-volume market burst targeting an injection rate of approximately 3,000,000 packets/sec. The system was evaluated against lossless lock-free SPSC (Single-Producer Single-Consumer) and MPSC (Multi-Producer Single-Consumer) architectures.
+
+| Metric | SPSC Baseline | MPSC Baseline | Collision Tree | Improvement (vs. SPSC) |
+|---|---|---|---|---|
+| Average Sojourn Latency | 2.43 ms | 1.84 ms | 240 µs (0.24 ms) | ~10× faster |
+| p99 Tail Latency | 25.17 ms | 19.48 ms | 1.18 ms | ~21× more stable |
+| Data Staleness Ratio | ~75% | ~75% | 10.95% | 6.8× fresher |
+| Backpressure Spins | >1,090,000 | 0 (bottlenecked) | 0 | Eliminated |
+| Packets/sec (Consumer) | Millions (historical) | Millions (historical) | ~87,000 (live edge only) | Maximises goodput |
 
 ### Micro-Architectural Trade-offs
-- **Instruction Overhead:** The Collision Tree requires ~94,600 instructions per successful operation (compared to 17,200 for SPSC). This 5.5x computational penalty is the physical cost of guaranteeing strict data freshness.
-- **Read Livelock:** The architecture sacrifices memory isolation to allow producers to overwrite active root nodes, resulting in ~28,000 dirty reads (aborts and retries) during the burst sequence. However, this intermittent livelock is a justified trade-off to avoid processing obsolete market data.
 
-## 🏗 System Architecture
+- **Instruction Overhead:** The Collision Tree requires approximately 94,600 instructions per successful operation, compared to 17,200 for SPSC — a 5.5× computational overhead that is the direct cost of enforcing strict data freshness.
+- **Read Livelock:** The architecture sacrifices memory isolation to allow producers to overwrite active root nodes. This produces ~28,000 dirty reads (aborts and retries) during the burst sequence, which is an accepted trade-off to avoid processing stale market data.
 
-The system mimics a production HFT ingress pipeline:
+---
 
-**Network Ingress (UDP):**
-Uses `SO_REUSEPORT` to allow multiple consumer threads to bind to the same multicast group, simulating hardware-based Receive Side Scaling (RSS).
+## System Architecture
 
-**The Collision Tree (The Core):**
-A probabilistic, lock-free data structure (located in `collision_arch/`).
-- Concurrent producers perform the computational heavy lifting of filtering, merging, and dropping stale data.
-- Incoming threads conflate intermediate ticks in-flight via a lock-free overwriting protocol.
-- The consumer strategy thread operates in strict $O(1)$ time by loading the root's sequence guard, copying the payload, and performing a final relaxed consistency check.
-- Result: Only actionable, live market data is exclusively evaluated.
+The system models a production HFT ingress pipeline across three layers.
 
-**Async Logging (The Observer):**
-A Lock-Free SPSC Ring Buffer (`spsc_arch/`).
-- Decouples the hot-path trading logic from the cold-path disk I/O.
-- Measures nanosecond-level latency without inducing "Observer Effect" stalls.
+**Network Ingress (UDP):** Uses `SO_REUSEPORT` to allow multiple consumer threads to bind to the same multicast group, simulating hardware-based Receive Side Scaling (RSS).
 
-## 🛠️ Build & Run
+**The Collision Tree (`collision_arch/`):** The core lock-free data structure. Concurrent producers handle filtering, merging, and dropping of stale data. Incoming threads conflate intermediate ticks in-flight via a lock-free overwriting protocol. The consumer (strategy thread) operates in strict O(1) time by loading the root's sequence guard, copying the payload, and performing a final relaxed consistency check — ensuring only actionable, live market data is evaluated.
+
+**Async Logger (`spsc_arch/`):** A lock-free SPSC ring buffer that decouples the hot-path trading logic from cold-path disk I/O, enabling nanosecond-level latency measurement without inducing observer-effect stalls.
+
+---
+
+## Project Structure
+
+```
+market_feed/
+├── collision_arch/
+│   ├── collision.h                  # Core Collision Tree algorithm
+│   ├── main_collision_multi.cpp     # Multi-asset engine entry point
+│   ├── exchange_simulator_fast.cpp  # Simulator (multi-asset)
+│   ├── analyze_collision.py         # Deep-dive analysis and plots
+│   └── analyze_collision_metrics.py # Thesis metrics report
+├── mpsc_arch/
+│   ├── mpsc_queue_lockfree.h        # Lock-free MPSC queue
+│   └── main_mpsc_metrics.cpp        # MPSC baseline engine
+├── spsc_arch/
+│   ├── spsc_queue.h                 # Lock-free SPSC ring buffer
+│   ├── main_spsc_metrics.cpp        # SPSC baseline engine
+│   └── capture_spsc.cpp             # Capture tool
+├── common.h                         # Shared MarketUpdate / RawUpdate structs
+├── logger.h                         # Async lock-free ring buffer logger
+├── udp_receiver.h                   # Raw socket wrapper (recvfrom, SO_REUSEPORT)
+├── tsc_clock.h                      # High-precision TSC timing
+├── exchange_simulator_fast.cpp      # Market data replay over UDP
+├── exchange_simulator_throttled.cpp # Throttled variant
+├── generate_multiset.py             # Multiplexes BTC data into 5 synthetic assets
+├── convert_fast.py                  # Converts official CSV trade data to binary
+└── analyze_results.py               # Comparative SPSC vs. MPSC dashboard
+```
+
+---
+
+## Build & Run
 
 ### Prerequisites
-- Linux Environment
-- `g++` (Supporting C++20)
-- `python3` (For traffic simulation and analysis)
 
-### 1. Compilation
-The project contains several components that can be compiled individually.
+- Linux (tested on Fedora)
+- `g++` with C++20 support
+- `python3` with `pandas`, `matplotlib`, `numpy`
+
+### Step 1 — Prepare Market Data
+
+Download a raw trade CSV (e.g., `BTCUSDT-aggTrades-2025-12.csv`) and convert it to binary format:
+
 ```bash
-# Example: compiling the collision architecture
-g++ -std=c++20 -O3 -pthread collision_arch/main_collision_multi.cpp -o hft_engine
+python3 convert_fast.py BTCUSDT-aggTrades-2025-12.csv market_data.bin
 ```
 
-### 2. Run the Engine
-Run the compiled binary:
+Generate the multi-asset dataset (5 synthetic symbols from BTC data):
+
 ```bash
-./hft_engine
+python3 generate_multiset.py
+# Output: multi_data.bin
 ```
 
-### 3. Start the Traffic Simulator
-In a second terminal, blast the market data using one of the simulators:
+### Step 2 — Compile
+
+**Collision Tree (multi-asset):**
 ```bash
-g++ -std=c++20 -O3 exchange_simulator_fast.cpp -o simulator
-./simulator
+g++ -std=c++20 -O3 -pthread collision_arch/main_collision_multi.cpp -o collision_arch/collision_multi
 ```
 
-### 4. Analyze Results
-After running the tests, compare the generated CSV logs:
+**Exchange Simulator (for Collision Tree):**
 ```bash
-python analyze_results.py
+g++ -std=c++20 -O3 collision_arch/exchange_simulator_fast.cpp -o collision_arch/exchange_multi
 ```
 
-## 📂 Project Structure
+**SPSC Baseline:**
+```bash
+g++ -std=c++20 -O3 -pthread spsc_arch/main_spsc_metrics.cpp -o spsc_arch/spsc_metrics
+```
 
-- `collision_arch/` - Core Logic: The lock-free Collision Tree algorithm (`collision.h`) and tests.
-- `mpsc_arch/` - Multi-Producer Single-Consumer lock-free queue architecture (Baseline).
-- `spsc_arch/` - Single-Producer Single-Consumer lock-free ring buffer architecture (Baseline).
-- `logger.h` - Async lock-free Ring Buffer logger.
-- `udp_receiver.h` - Raw socket wrapper handling `recvfrom` and `SO_REUSEPORT`.
-- `tsc_clock.h` - High precision timing using TSC.
-- `exchange_simulator_*.cpp` - Market data replays over UDP.
-- `analyze_results.py` - Generates performance stats and graphs from CSV logs.
+**MPSC Baseline:**
+```bash
+g++ -std=c++20 -O3 -pthread mpsc_arch/main_mpsc_metrics.cpp -o mpsc_arch/mpsc_metrics
+```
+
+**General Simulator (for SPSC/MPSC baselines):**
+```bash
+g++ -std=c++20 -O3 exchange_simulator_fast.cpp -o exchange_fast
+```
+
+### Step 3 — Run a Benchmark
+
+Open two terminals. In the first, start the engine:
+
+```bash
+# Collision Tree
+./collision_arch/collision_multi
+
+# or SPSC baseline
+./spsc_arch/spsc_metrics
+
+# or MPSC baseline
+./mpsc_arch/mpsc_metrics
+```
+
+In the second terminal, start the simulator:
+
+```bash
+# For Collision Tree (uses multi_data.bin)
+./collision_arch/exchange_multi
+
+# For SPSC/MPSC baselines (uses market_data.bin)
+./exchange_fast
+```
+
+The simulator runs for 30 seconds then exits cleanly. Press **Enter** in the engine terminal to stop it and flush logs.
+
+### Step 4 — Analyze Results
+
+**Collision Tree deep-dive (latency distribution, load balancing, price feed):**
+```bash
+cd collision_arch
+python3 analyze_collision.py
+# Output: collision_deep_dive.png
+```
+
+**Collision Tree thesis metrics (sojourn time, p99, staleness, throughput):**
+```bash
+cd collision_arch
+python3 analyze_collision_metrics.py <backpressure_spins> <duration_sec>
+# Example: python3 analyze_collision_metrics.py 0 30.0
+```
+
+**Comparative SPSC vs. MPSC dashboard:**
+```bash
+python3 analyze_results.py <spsc_spins> <mpsc_spins>
+# Output: thesis_dashboard.png
+```
+
+---
+
+## License
+
+See [LICENSE](LICENSE).
